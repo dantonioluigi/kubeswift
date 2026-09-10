@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	// Embedded zoneinfo, so the explicit-zone test does not depend on host tzdata.
+	_ "time/tzdata"
 
 	"github.com/robfig/cron/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -228,6 +230,71 @@ func TestReconcile_StartingDeadline_SkipsTooLate(t *testing.T) {
 	_ = c.Get(context.Background(), req().NamespacedName, &after)
 	if after.Status.LastScheduleTime == nil || !after.Status.LastScheduleTime.Time.Equal(midnight) {
 		t.Errorf("skipped tick should still advance lastScheduleTime to %v; got %v", midnight, after.Status.LastScheduleTime)
+	}
+}
+
+// withLocalTZ stands in for a pod given a timezone (a mounted /etc/localtime),
+// or a contributor running the suite outside UTC.
+func withLocalTZ(t *testing.T, offset time.Duration) {
+	t.Helper()
+	orig := time.Local
+	time.Local = time.FixedZone("TEST", int(offset/time.Second))
+	t.Cleanup(func() { time.Local = orig })
+}
+
+// spec.schedule is documented as UTC; unpinned, it would follow the zone of the
+// times the reconcile loop hands it, which are always local.
+func TestParseScheduleUTC_IgnoresProcessTimezone(t *testing.T) {
+	withLocalTZ(t, 5*time.Hour)
+
+	sched, err := parseScheduleUTC("0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A local-zone time, as the reconcile loop passes.
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.Local)
+	want := time.Date(2026, 6, 6, 2, 0, 0, 0, time.UTC)
+	if got := sched.Next(from); !got.Equal(want) {
+		t.Errorf("next tick = %v (%v UTC), want %v", got, got.UTC(), want)
+	}
+}
+
+// Pinning UTC must not override a zone the expression asked for.
+func TestParseScheduleUTC_HonoursExplicitZone(t *testing.T) {
+	withLocalTZ(t, 5*time.Hour)
+
+	sched, err := parseScheduleUTC("CRON_TZ=Asia/Tokyo 0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 00:00 UTC is already 09:00 in Tokyo, so the next 02:00 there is tomorrow's.
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 6, 7, 2, 0, 0, 0, tokyo)
+	if got := sched.Next(from); !got.Equal(want) {
+		t.Errorf("next tick = %v (%v UTC), want %v", got, got.UTC(), want)
+	}
+}
+
+// @every has no location; pinning must not drop it on the type assertion.
+func TestParseScheduleUTC_IntervalSchedule(t *testing.T) {
+	sched, err := parseScheduleUTC("@every 30m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC)
+	if got, want := sched.Next(from), from.Add(30*time.Minute); !got.Equal(want) {
+		t.Errorf("next tick = %v, want %v", got, want)
+	}
+}
+
+// Parser errors pass through unchanged.
+func TestParseScheduleUTC_RejectsInvalid(t *testing.T) {
+	if _, err := parseScheduleUTC("not a cron"); err == nil {
+		t.Error("expected an error for an invalid cron expression")
 	}
 }
 
